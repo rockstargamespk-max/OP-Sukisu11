@@ -280,6 +280,104 @@ patch_lsm_hook "$KSU_FOLDER/kernel/hook/lsm_hook.c"
 patch_lsm_hook "$COMMON_KERNEL_FOLDER/drivers/kernelsu/hook/lsm_hook.c"
 repair_selinux_hide_linkage "$COMMON_KERNEL_FOLDER"
 
+# OP15's 6.12 SELinux tree does not export the policy-specific helper used by
+# the injected my_setprocattr() implementation. Adapt that call to the
+# upstream/vendor API available in this tree instead of leaving an unresolved
+# external symbol at vmlinux link time. This fallback uses the active policy;
+# it does not provide backup-policy conversion semantics.
+if [[ "$KERNEL_VER_LOCAL" == "6.12" ]]; then
+  python3 - "$COMMON_KERNEL_FOLDER/security/selinux/hooks.c" <<'PYCOMPAT'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+if not p.is_file():
+    raise SystemExit(f"::error::SELinux hooks source missing: {p}")
+s = p.read_text()
+name = "security_context_to_sid_with_policy"
+if name not in s:
+    print("OP15 SELinux helper compatibility: no with_policy call found; nothing to adapt")
+    raise SystemExit(0)
+
+def split_args(text):
+    args, start = [], 0
+    depth = 0
+    quote = None
+    escaped = False
+    for i, ch in enumerate(text):
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(text[start:i].strip())
+            start = i + 1
+    args.append(text[start:].strip())
+    return args
+
+# Rewrite function invocations (not declarations/comments). The policy-specific
+# helper convention takes policy as its first argument; the normal API takes
+# context, length, sid, gfp.
+out, pos = [], 0
+while True:
+    idx = s.find(name, pos)
+    if idx < 0:
+        out.append(s[pos:])
+        break
+    out.append(s[pos:idx])
+    j = idx + len(name)
+    k = j
+    while k < len(s) and s[k].isspace():
+        k += 1
+    if k >= len(s) or s[k] != "(":
+        out.append(s[idx:j])
+        pos = j
+        continue
+    # Find the matching close parenthesis.
+    depth, q, esc, end = 0, None, False, None
+    for n in range(k, len(s)):
+        ch = s[n]
+        if q:
+            if esc: esc = False
+            elif ch == "\\": esc = True
+            elif ch == q: q = None
+            continue
+        if ch in ("'", '"'): q = ch
+        elif ch == "(": depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                end = n
+                break
+    if end is None:
+        raise SystemExit(f"::error::Unbalanced {name} invocation in {p}")
+    # Avoid touching prototypes/declarations or comments: only adapt a call
+    # that has a semicolon/closing expression after it and a known argument list.
+    args = split_args(s[k+1:end])
+    if len(args) == 5:
+        args = args[1:]
+    elif len(args) != 4:
+        raise SystemExit(f"::error::Unexpected {name} argument count ({len(args)}) in {p}; refusing unsafe rewrite")
+    out.append("security_context_to_sid(" + ", ".join(args) + ")")
+    pos = end + 1
+s2 = "".join(out)
+if s2 == s:
+    raise SystemExit(f"::error::Failed to adapt {name} in {p}")
+p.write_text(s2)
+print("OP15 SELinux helper compatibility: adapted my_setprocattr() to security_context_to_sid()")
+PYCOMPAT
+fi
+
 COMMON_HIDE="$COMMON_KERNEL_FOLDER/drivers/kernelsu/feature/selinux_hide.c"
 COMMON_LSM="$COMMON_KERNEL_FOLDER/drivers/kernelsu/hook/lsm_hook.c"
 COMMON_SEPOLICY_H="$COMMON_KERNEL_FOLDER/drivers/kernelsu/selinux/sepolicy.h"
