@@ -194,18 +194,25 @@ if kernel_version >= (6, 6):
         "security_compute_av_user_with_policy",
     )
     for name in helper_names:
-        # Strip file-local linkage only from the actual helper declaration.
+        # Kernel branches do not all carry the same policy-specific SELinux
+        # helpers. Only adjust linkage when this branch contains a real
+        # implementation; absence alone is not a SELinux-hide patch failure.
+        # If SukiSU code actually depends on a missing API, the normal compile
+        # or link stage will report that concrete incompatibility.
+        body_pattern = rf"(?s)(?m)^[\t ]*(?:static[\t ]+)?(?:int|void)[\t ]+{name}\s*\([^;]*?\)\s*\{{"
+        match = re.search(body_pattern, service_text)
+        if not match:
+            print(f"SELinux policy helper not present in this kernel branch; skipping linkage adjustment: {name}")
+            continue
+
+        # Strip file-local linkage only from the actual implementation.
         service_text = re.sub(
             rf"(?m)^([\t ]*)static[\t ]+(int|void)[\t ]+{name}([\t ]*\()",
             r"\1\2 " + name + r"\3",
             service_text,
+            count=1,
         )
-        # A declaration alone is not sufficient: verify a real function body.
-        body_pattern = rf"(?s)(?m)^[\t ]*(?:static[\t ]+)?(?:int|void)[\t ]+{name}\s*\([^;]*?\)\s*\{{"
-        if not re.search(body_pattern, service_text):
-            raise SystemExit(f"::error::SELinux policy helper implementation missing in {services}: {name}")
-        global_pattern = rf"(?s)(?m)^[\t ]*(?:static[\t ]+)?(?:int|void)[\t ]+{name}\s*\([^;]*?\)\s*\{{"
-        match = re.search(global_pattern, service_text)
+        match = re.search(body_pattern, service_text)
         if match and re.match(r"[\t ]*static\b", match.group(0)):
             raise SystemExit(f"::error::SELinux policy helper remains static in {services}: {name}")
     services.write_text(service_text)
