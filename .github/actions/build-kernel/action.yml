@@ -2562,29 +2562,40 @@ runs:
         MATCH_COUNT=0
         for candidate in "${APK_CANDIDATES[@]}"; do
           BADGING="$("$AAPT" dump badging "$candidate" 2>/dev/null || true)"
-          # Official Nova source currently retains the upstream app identity.
-          # The package is com.sukisu.ultra and the app label is SukiSU.
-          if ! grep -q "^package: name='com\.sukisu\.ultra'" <<< "$BADGING"; then
+          PACKAGE_NAME="$(sed -n "s/^package: name='\\([^']*\\)'.*/\\1/p" <<< "$BADGING" | head -n 1)"
+
+          # Do not hard-code the visible application label: upstream can
+          # change or localize it without changing the Manager package.
+          if [ "$PACKAGE_NAME" != "com.sukisu.ultra" ]; then
+            echo "Skipping $(basename "$candidate"): package='${PACKAGE_NAME:-unreadable}'"
             continue
           fi
-          if ! grep -q "^application-label:'SukiSU'" <<< "$BADGING"; then
+
+          # Verify ARM64 from the APK contents. The official Manager artifact
+          # is universal and may omit native-code metadata from aapt badging.
+          APK_ENTRIES="$(unzip -Z1 "$candidate" 2>/dev/null || true)"
+          if ! grep -q '^lib/arm64-v8a/' <<< "$APK_ENTRIES"; then
+            echo "Skipping $(basename "$candidate"): no lib/arm64-v8a payload"
             continue
           fi
-          # The Manager CI artifact is a universal APK, so the filename does
-          # not necessarily contain "arm64-v8a". Verify the packaged ABI.
-          if ! grep -q "^native-code:.*'arm64-v8a'" <<< "$BADGING" && \\
-             [[ "$(basename "$candidate")" != *arm64-v8a* ]]; then
-            continue
-          fi
+
           cp -f "$candidate" "$APK_PATH"
           MATCH_COUNT=$((MATCH_COUNT + 1))
+          echo "Validated Manager APK: $(basename "$candidate") (package=${PACKAGE_NAME}, ARM64 payload present)"
         done
 
         if [ "$MATCH_COUNT" -ne 1 ] || [ ! -s "$APK_PATH" ]; then
-          echo "::error::Expected exactly one SukiSU Nova arm64 Manager APK in the latest CI artifact; found ${MATCH_COUNT}"
-          printf 'APK in artifact: %s\n' "${APK_CANDIDATES[@]}"
+          echo "::error::Expected exactly one com.sukisu.ultra Manager APK with ARM64 payload in the latest CI artifact; found ${MATCH_COUNT}"
+          printf 'APK in artifact: %s\\n' "${APK_CANDIDATES[@]}"
+          for candidate in "${APK_CANDIDATES[@]}"; do
+            echo "--- aapt badging: $(basename "$candidate") ---"
+            "$AAPT" dump badging "$candidate" 2>&1 | head -n 12 || true
+            echo "--- packaged ARM64 libraries ---"
+            unzip -Z1 "$candidate" 2>/dev/null | grep '^lib/arm64-v8a/' | head -n 5 || true
+          done
           exit 1
         fi
+
         if ! unzip -tq "$APK_PATH" >/dev/null 2>&1; then
           echo "::error::Selected SukiSU Nova Manager APK failed archive validation"
           exit 1
