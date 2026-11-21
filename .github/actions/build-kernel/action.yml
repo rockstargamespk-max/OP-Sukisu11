@@ -2480,9 +2480,9 @@ runs:
       run: |
         set -euo pipefail
 
-        # The official SukiSU Nova website identifies this Telegram channel as
-        # the Test Builds channel. Scan its latest public posts on every run.
-        TEST_BUILD_CHANNEL="https://t.me/s/Sukiksu"
+        # The official Test Builds discussion is the SukiSU group topic linked
+        # from the Nova website. Scan that topic, not the unrelated group feed.
+        TEST_BUILD_CHANNEL="https://t.me/s/Sukiksu/7114"
         WORK_DIR="$RUNNER_TEMP/sukisu-nova-experimental"
         PAGE_HTML="$WORK_DIR/test-build-channel.html"
         APK_PATH="$WORK_DIR/SukiSU-Nova-Manager-latest.apk"
@@ -2493,10 +2493,10 @@ runs:
         curl --silent --show-error --fail --location --retry 3 --retry-delay 2 \
           -A "Mozilla/5.0" "$TEST_BUILD_CHANNEL" --output "$PAGE_HTML"
 
-        # Telegram's public channel preview contains recent posts and their
-        # document links. Choose the newest post containing a SukiSU Nova
-        # ARM64 Manager APK; do not pin a post ID or a version number.
-        python3 - "$PAGE_HTML" "$WORK_DIR/experimental-apk-url.txt" "$WORK_DIR/experimental-apk-name.txt" <<'PY'
+        # Telegram puts data-post on the outer *_message_wrap element, while
+        # the attachment filename is nested in document_title (not necessarily
+        # in the anchor text). Parse both structures and keep only real file URLs.
+        python3 - "$PAGE_HTML" "$WORK_DIR/experimental-apk-url.txt" "$WORK_DIR/experimental-apk-name.txt" <<'PYCODE'
         import html, re, sys
         from html.parser import HTMLParser
         from urllib.parse import urlparse
@@ -2510,91 +2510,102 @@ runs:
                 self.messages = []
                 self.message = None
                 self.anchor = None
+                self.doc_title_depth = 0
 
             def handle_starttag(self, tag, attrs):
                 attrs = dict(attrs)
-                classes = attrs.get("class", "").split()
-                if tag == "div" and "tgme_widget_message" in classes and "data-post" in attrs:
-                    self.message = {
-                        "post": attrs["data-post"],
-                        "anchors": [],
+                classes = set(attrs.get("class", "").split())
+                # Telegram's data-post attribute belongs to message_wrap,
+                # not the nested tgme_widget_message content element.
+                if tag == "div" and "data-post" in attrs and (
+                    "tgme_widget_message_wrap" in classes or
+                    "tgme_widget_message" in classes
+                ):
+                    self.message = {"post": attrs["data-post"], "text": [], "documents": []}
+                    self.messages.append(self.message)
+                    self.anchor = None
+                    self.doc_title_depth = 0
+                    return
+                if self.message is None:
+                    return
+                if tag == "a" and attrs.get("href"):
+                    self.anchor = {
+                        "url": html.unescape(attrs["href"]),
+                        "class": attrs.get("class", ""),
+                        "title": attrs.get("title", ""),
                         "text": [],
                     }
-                    self.messages.append(self.message)
-                if self.message is not None:
-                    if tag == "a" and attrs.get("href"):
-                        self.anchor = {
-                            "url": html.unescape(attrs["href"]),
-                            "title": attrs.get("title", ""),
-                            "class": attrs.get("class", ""),
-                            "text": [],
-                        }
+                if tag in ("div", "span") and "tgme_widget_message_document_title" in classes:
+                    self.doc_title_depth += 1
+                if tag == "div" and "tgme_widget_message_wrap" in classes and attrs.get("data-post") is None:
+                    # A nested wrapper is not a new message; ignore it.
+                    pass
 
             def handle_data(self, data):
-                if self.message is not None:
-                    self.message["text"].append(data)
+                if self.message is None:
+                    return
+                self.message["text"].append(data)
                 if self.anchor is not None:
                     self.anchor["text"].append(data)
+                if self.doc_title_depth:
+                    self.message["documents"].append(data)
 
             def handle_endtag(self, tag):
+                if self.message is None:
+                    return
                 if tag == "a" and self.anchor is not None:
-                    self.message["anchors"].append(self.anchor)
+                    self.message.setdefault("anchors", []).append(self.anchor)
                     self.anchor = None
-                elif tag == "div" and self.message is not None:
-                    # The message wrapper closes after all its nested content.
-                    # Keep the current message until the next message wrapper;
-                    # nested div closures do not affect candidate collection.
-                    pass
+                if tag in ("div", "span") and self.doc_title_depth:
+                    self.doc_title_depth -= 1
 
         parser = TelegramParser()
         parser.feed(source)
-
         candidates = []
         for message in parser.messages:
             post_match = re.search(r"/(\d+)$", message["post"])
             post_id = int(post_match.group(1)) if post_match else -1
-            message_text = " ".join(message["text"])
-            for anchor in message["anchors"]:
-                anchor_label = " ".join([
-                    anchor.get("title", ""),
-                    " ".join(anchor.get("text", [])),
-                ])
-                is_document = (
-                    "document" in anchor.get("class", "").lower()
-                    or ".apk" in anchor["url"].lower()
-                    or ".apk" in anchor_label.lower()
-                )
-                if not is_document:
-                    continue
-                searchable = (anchor["url"] + " " + anchor_label + " " + message_text).lower()
+            for anchor in message.get("anchors", []):
+                label = " ".join((anchor.get("title", ""), " ".join(anchor.get("text", []))))
                 filename_match = re.search(
                     r"([a-z0-9_.+-]*sukisu[a-z0-9_.+-]*\.apk)",
-                    searchable,
+                    label,
                     re.IGNORECASE,
                 )
                 if not filename_match:
+                    filename_match = re.search(
+                        r"([a-z0-9_.+-]*sukisu[a-z0-9_.+-]*\.apk)",
+                        " ".join(message.get("documents", [])),
+                        re.IGNORECASE,
+                    )
+                if not filename_match or "nova" not in filename_match.group(1).lower():
                     continue
-                filename = filename_match.group(1)
-                if "nova" not in filename.lower() or not re.search(r"arm64|arm64-v8a", filename, re.I):
-                    continue
-                parsed = urlparse(anchor["url"])
+                url = anchor["url"]
+                parsed = urlparse(url)
                 if parsed.scheme != "https" or not parsed.netloc:
                     continue
-                candidates.append((post_id, anchor["url"], filename))
+                # Ignore Telegram message permalinks; they are not file downloads.
+                if parsed.netloc.lower() in ("t.me", "www.t.me", "telegram.me", "www.telegram.me"):
+                    continue
+                if "document" not in anchor.get("class", "").lower() and ".apk" not in url.lower():
+                    continue
+                filename = re.sub(r"\s+", "_", filename_match.group(1)).strip("_")
+                candidates.append((post_id, url, filename))
 
         if not candidates:
+            seen = len(parser.messages)
             raise SystemExit(
-                "No SukiSU Nova ARM64 Manager APK was exposed in the latest official Telegram Test Builds channel posts"
+                f"No downloadable SukiSU Nova APK attachment found in Test Builds topic; parsed {seen} Telegram posts. "
+                "Telegram may have changed its attachment markup or the newest post may not contain a public file URL."
             )
 
-        # Telegram post IDs increase over time; choose the newest matching post.
         post_id, apk_url, apk_name = max(candidates, key=lambda item: item[0])
         open(url_path, "w", encoding="utf-8").write(apk_url)
         open(name_path, "w", encoding="utf-8").write(apk_name)
-        print(f"Selected Telegram post: {post_id}")
+        print(f"Selected newest matching Telegram post: {post_id}")
         print(f"Selected experimental APK: {apk_name}")
-        print(f"Telegram attachment URL: {apk_url}")
-        PY
+        print(f"Attachment URL: {apk_url}")
+        PYCODE
 
         APK_URL="$(cat "$WORK_DIR/experimental-apk-url.txt")"
         APK_NAME="$(cat "$WORK_DIR/experimental-apk-name.txt")"
@@ -2641,7 +2652,7 @@ runs:
 
         mkdir -p "$AK3_FOLDER"
         cp -f "$APK_PATH" "$AK3_FOLDER/SukiSU-Nova-Manager-latest.apk"
-        echo "Included the newest experimental SukiSU Nova Manager from the official Telegram Test Builds channel"
+        echo "Included the newest experimental SukiSU Nova Manager from the official Telegram Test Builds topic"
         echo "Original attachment: ${APK_NAME}"
         echo "Stable GitHub releases and GitHub Actions Manager artifacts were not used"
     - name: Create Kernel ZIP
