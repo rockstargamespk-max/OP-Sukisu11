@@ -2562,13 +2562,17 @@ runs:
         MATCH_COUNT=0
         for candidate in "${APK_CANDIDATES[@]}"; do
           BADGING="$("$AAPT" dump badging "$candidate" 2>/dev/null || true)"
-          if ! grep -q "^package: name='com\.sukisu\.nova'" <<< "$BADGING"; then
+          # Official Nova source currently retains the upstream app identity.
+          # The package is com.sukisu.ultra and the app label is SukiSU.
+          if ! grep -q "^package: name='com\.sukisu\.ultra'" <<< "$BADGING"; then
             continue
           fi
-          if ! grep -q "^application-label:'SukiSU Nova'" <<< "$BADGING"; then
+          if ! grep -q "^application-label:'SukiSU'" <<< "$BADGING"; then
             continue
           fi
-          if ! grep -q "^native-code:.*'arm64-v8a'" <<< "$BADGING" && \
+          # The Manager CI artifact is a universal APK, so the filename does
+          # not necessarily contain "arm64-v8a". Verify the packaged ABI.
+          if ! grep -q "^native-code:.*'arm64-v8a'" <<< "$BADGING" && \\
              [[ "$(basename "$candidate")" != *arm64-v8a* ]]; then
             continue
           fi
@@ -2588,8 +2592,14 @@ runs:
 
         mkdir -p "$AK3_FOLDER"
         cp -f "$APK_PATH" "$AK3_FOLDER/SukiSU-Nova-Manager-latest.apk"
-        echo "Included latest SukiSU Nova Manager CI artifact: run ${RUN_ID}, commit ${RUN_SHA}"
-        echo "Manager APK: $(basename "${APK_CANDIDATES[0]}") (selected and verified from artifact ${ARTIFACT_ID})"
+        SELECTED_BADGING="$("$AAPT" dump badging "$APK_PATH")"
+        MANAGER_VERSION_CODE="$(sed -n "s/^package:.*versionCode='\\([^']*\\)'.*/\\1/p" <<< "$SELECTED_BADGING")"
+        MANAGER_VERSION_NAME="$(sed -n "s/^package:.*versionName='\\([^']*\\)'.*/\\1/p" <<< "$SELECTED_BADGING")"
+        echo "Included official SukiSU Nova Manager CI artifact: run ${RUN_ID}, commit ${RUN_SHA}"
+        echo "Manager APK: $(basename "$APK_PATH")"
+        echo "Manager package: com.sukisu.ultra"
+        echo "Manager version: ${MANAGER_VERSION_NAME:-unknown} (${MANAGER_VERSION_CODE:-unknown})"
+        echo "Artifact ID: ${ARTIFACT_ID}"
     - name: Create Kernel ZIP
       id: create_zip
       shell: bash
