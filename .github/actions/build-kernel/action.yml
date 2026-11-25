@@ -2475,78 +2475,102 @@ runs:
 
         echo "::endgroup::"
 
-    - name: Download latest SukiSU Nova Manager from CI
+    - name: Download latest experimental SukiSU Nova Manager
       shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
 
-        MANAGER_REPO="SukiSU-Nova/SukiSU-Nova"
-        MANAGER_BRANCH="main"
-        WORKFLOW_FILE="build-manager.yml"
-        ARTIFACT_NAME="Manager"
-        WORK_DIR="$RUNNER_TEMP/sukisu-nova-manager-ci"
-        RUN_JSON="$WORK_DIR/latest-run.json"
-        ARTIFACTS_JSON="$WORK_DIR/artifacts.json"
-        ARTIFACT_ZIP="$WORK_DIR/manager-artifact.zip"
-        EXTRACT_DIR="$WORK_DIR/extracted"
-        APK_PATH="$WORK_DIR/SukiSU-Nova-Manager-latest.apk"
-        mkdir -p "$WORK_DIR" "$EXTRACT_DIR"
+        # The official SukiSU Nova website labels this Telegram post as its
+        # Test Builds / Latest Test Build channel. GitHub Releases are stable;
+        # this workflow intentionally does not fall back to stable or CI APKs.
+        TEST_BUILD_URL="https://t.me/Sukiksu/7114"
+        TEST_BUILD_PAGE="https://t.me/s/Sukiksu/7114"
+        WORK_DIR="$RUNNER_TEMP/sukisu-nova-experimental"
+        PAGE_HTML="$WORK_DIR/test-build.html"
+        APK_PATH="$WORK_DIR/SukiSU-Nova-Manager-experimental.apk"
+        mkdir -p "$WORK_DIR"
 
-        if [ -z "${GH_TOKEN:-}" ]; then
-          echo "::error::GITHUB_TOKEN is required to download the official SukiSU Nova Manager CI artifact"
-          exit 1
-        fi
-
-        API_HEADERS=(-H "Authorization: Bearer ${GH_TOKEN}" \
-                     -H "Accept: application/vnd.github+json" \
-                     -H "X-GitHub-Api-Version: 2022-11-28")
-
-        echo "Resolving latest successful SukiSU Nova Manager CI run on ${MANAGER_BRANCH}"
+        echo "Source: official SukiSU Nova website -> Test Builds (Telegram)"
+        echo "Resolving latest experimental Manager APK from ${TEST_BUILD_URL}"
         curl --silent --show-error --fail --location --retry 3 --retry-delay 2 \
-          "${API_HEADERS[@]}" \
-          "https://api.github.com/repos/${MANAGER_REPO}/actions/workflows/${WORKFLOW_FILE}/runs?branch=${MANAGER_BRANCH}&status=success&event=push&per_page=1" \
-          --output "$RUN_JSON"
+          -A "Mozilla/5.0" "$TEST_BUILD_PAGE" --output "$PAGE_HTML"
 
-        RUN_ID="$(jq -r '.workflow_runs[0].id // empty' "$RUN_JSON")"
-        RUN_SHA="$(jq -r '.workflow_runs[0].head_sha // empty' "$RUN_JSON")"
-        RUN_URL="$(jq -r '.workflow_runs[0].html_url // empty' "$RUN_JSON")"
-        if [ -z "$RUN_ID" ] || [ -z "$RUN_SHA" ]; then
-          echo "::error::No successful push run found for ${MANAGER_REPO}/${WORKFLOW_FILE} on ${MANAGER_BRANCH}"
-          exit 1
-        fi
-        echo "Latest Manager CI run: ${RUN_ID} (${RUN_SHA})"
-        [ -z "$RUN_URL" ] || echo "Manager CI run URL: ${RUN_URL}"
+        # Telegram's public post page exposes the attached document's filename
+        # and download URL. Select APK documents only; never select a stable
+        # GitHub release or the old GitHub Actions Manager artifact.
+        python3 - "$PAGE_HTML" "$WORK_DIR/experimental-apk-url.txt" "$WORK_DIR/experimental-apk-name.txt" <<'PY'
+        import html, re, sys
+        from html.parser import HTMLParser
+        from urllib.parse import urljoin
 
+        page_path, url_path, name_path = sys.argv[1:]
+        source = open(page_path, encoding="utf-8", errors="replace").read()
+
+        class TelegramAPKParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.links = []
+                self.current_href = None
+                self.current_text = []
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                href = attrs.get("href", "")
+                title = attrs.get("title", "")
+                download = attrs.get("download", "")
+                label = " ".join((title, download))
+                if href and (".apk" in href.lower() or ".apk" in label.lower()):
+                    self.links.append((href, label))
+                if tag == "a" and href:
+                    self.current_href = href
+                    self.current_text = []
+            def handle_data(self, data):
+                if self.current_href is not None:
+                    self.current_text.append(data)
+            def handle_endtag(self, tag):
+                if tag == "a" and self.current_href is not None:
+                    label = " ".join(self.current_text)
+                    if ".apk" in label.lower():
+                        self.links.append((self.current_href, label))
+                    self.current_href = None
+                    self.current_text = []
+
+        parser = TelegramAPKParser()
+        parser.feed(source)
+        candidates = []
+        for href, label in parser.links:
+            href = html.unescape(href.strip())
+            label = html.unescape(label.strip())
+            if ".apk" in (href + " " + label).lower():
+                candidates.append((urljoin("https://t.me/", href), label or href))
+        # Preserve page order and de-duplicate; the last APK document is the
+        # newest attachment shown by the linked official test-build post.
+        unique = []
+        seen = set()
+        for item in candidates:
+            if item[0] not in seen:
+                unique.append(item)
+                seen.add(item[0])
+        if not unique:
+            raise SystemExit("No downloadable APK document was exposed by the official Telegram test-build page")
+        url, name = unique[-1]
+        open(url_path, "w").write(url)
+        open(name_path, "w").write(name)
+        print("Telegram APK attachment:", name)
+        print("Telegram download URL:", url)
+        PY
+
+        APK_URL="$(cat "$WORK_DIR/experimental-apk-url.txt")"
+        APK_NAME="$(cat "$WORK_DIR/experimental-apk-name.txt")"
+        echo "Downloading experimental APK: ${APK_NAME}"
         curl --silent --show-error --fail --location --retry 3 --retry-delay 2 \
-          "${API_HEADERS[@]}" \
-          "https://api.github.com/repos/${MANAGER_REPO}/actions/runs/${RUN_ID}/artifacts" \
-          --output "$ARTIFACTS_JSON"
-
-        ARTIFACT_ID="$(jq -r --arg name "$ARTIFACT_NAME" \
-          '.artifacts[] | select(.name == $name and .expired == false) | .id' \
-          "$ARTIFACTS_JSON" | head -n 1)"
-        if [ -z "$ARTIFACT_ID" ]; then
-          echo "::error::Latest Manager CI run ${RUN_ID} has no unexpired '${ARTIFACT_NAME}' artifact"
-          jq -r '.artifacts[]? | "Available artifact: \(.name) (expired=\(.expired))"' "$ARTIFACTS_JSON"
+          "$APK_URL" --output "$APK_PATH"
+        if [ ! -s "$APK_PATH" ] || ! file "$APK_PATH" | grep -qi 'Zip archive\|Android package'; then
+          echo "::error::The official experimental Telegram attachment is not a valid APK file"
+          file "$APK_PATH" || true
           exit 1
         fi
-
-        curl --fail --location --retry 3 --retry-delay 2 --retry-all-errors \
-          "${API_HEADERS[@]}" \
-          "https://api.github.com/repos/${MANAGER_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
-          --output "$ARTIFACT_ZIP"
-
-        if [ ! -s "$ARTIFACT_ZIP" ] || ! unzip -tq "$ARTIFACT_ZIP" >/dev/null 2>&1; then
-          echo "::error::Downloaded Manager CI artifact is not a valid ZIP"
-          exit 1
-        fi
-        unzip -q "$ARTIFACT_ZIP" -d "$EXTRACT_DIR"
-
-        mapfile -t APK_CANDIDATES < <(find "$EXTRACT_DIR" -type f -iname '*.apk' | sort)
-        if [ "${#APK_CANDIDATES[@]}" -eq 0 ]; then
-          echo "::error::The latest Manager CI artifact contains no APK"
+        if ! unzip -tq "$APK_PATH" >/dev/null 2>&1; then
+          echo "::error::Experimental Manager APK failed ZIP integrity validation"
           exit 1
         fi
 
@@ -2554,63 +2578,35 @@ runs:
         if [ -z "$AAPT" ] && [ -n "${ANDROID_HOME:-}" ]; then
           AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt 2>/dev/null | sort -V | tail -n1)"
         fi
-        if [ -z "$AAPT" ]; then
-          echo "::error::aapt is required to verify the Manager APK package and ABI"
-          exit 1
-        fi
-
-        MATCH_COUNT=0
-        for candidate in "${APK_CANDIDATES[@]}"; do
-          BADGING="$("$AAPT" dump badging "$candidate" 2>/dev/null || true)"
-          PACKAGE_NAME="$(sed -n "s/^package: name='\\([^']*\\)'.*/\\1/p" <<< "$BADGING" | head -n 1)"
-
-          # Do not hard-code the visible application label: upstream can
-          # change or localize it without changing the Manager package.
-          if [ "$PACKAGE_NAME" != "com.sukisu.ultra" ]; then
-            echo "Skipping $(basename "$candidate"): package='${PACKAGE_NAME:-unreadable}'"
-            continue
+        if [ -n "$AAPT" ]; then
+          BADGING="$("$AAPT" dump badging "$APK_PATH" 2>/dev/null || true)"
+          PACKAGE="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$BADGING" | head -n1)"
+          VERSION_NAME="$(sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" <<< "$BADGING" | head -n1)"
+          VERSION_CODE="$(sed -n "s/^package:.*versionCode='\([^']*\)'.*/\1/p" <<< "$BADGING" | head -n1)"
+          if ! grep -q '^native-code:.*arm64-v8a' <<< "$BADGING" && \
+             ! unzip -Z1 "$APK_PATH" | grep -q '^lib/arm64-v8a/'; then
+            echo "::error::Experimental SukiSU Nova Manager APK does not contain ARM64 support"
+            exit 1
           fi
-
-          # Verify ARM64 from the APK contents. The official Manager artifact
-          # is universal and may omit native-code metadata from aapt badging.
-          APK_ENTRIES="$(unzip -Z1 "$candidate" 2>/dev/null || true)"
-          if ! grep -q '^lib/arm64-v8a/' <<< "$APK_ENTRIES"; then
-            echo "Skipping $(basename "$candidate"): no lib/arm64-v8a payload"
-            continue
+          if [[ "$PACKAGE" != com.sukisu.nova && "$PACKAGE" != com.sukisu.ultra ]]; then
+            echo "::error::Unexpected SukiSU Manager package: ${PACKAGE:-unknown}"
+            exit 1
           fi
-
-          cp -f "$candidate" "$APK_PATH"
-          MATCH_COUNT=$((MATCH_COUNT + 1))
-          echo "Validated Manager APK: $(basename "$candidate") (package=${PACKAGE_NAME}, ARM64 payload present)"
-        done
-
-        if [ "$MATCH_COUNT" -ne 1 ] || [ ! -s "$APK_PATH" ]; then
-          echo "::error::Expected exactly one com.sukisu.ultra Manager APK with ARM64 payload in the latest CI artifact; found ${MATCH_COUNT}"
-          printf 'APK in artifact: %s\\n' "${APK_CANDIDATES[@]}"
-          for candidate in "${APK_CANDIDATES[@]}"; do
-            echo "--- aapt badging: $(basename "$candidate") ---"
-            "$AAPT" dump badging "$candidate" 2>&1 | head -n 12 || true
-            echo "--- packaged ARM64 libraries ---"
-            unzip -Z1 "$candidate" 2>/dev/null | grep '^lib/arm64-v8a/' | head -n 5 || true
-          done
-          exit 1
-        fi
-
-        if ! unzip -tq "$APK_PATH" >/dev/null 2>&1; then
-          echo "::error::Selected SukiSU Nova Manager APK failed archive validation"
-          exit 1
+          echo "Experimental Manager package: ${PACKAGE}"
+          echo "Experimental Manager version: ${VERSION_NAME:-unknown} (${VERSION_CODE:-unknown})"
+        else
+          echo "::warning::aapt unavailable; APK archive and ARM64 library checks will be used"
+          if ! unzip -Z1 "$APK_PATH" | grep -q '^lib/arm64-v8a/'; then
+            echo "::error::Cannot verify ARM64 support in experimental APK without aapt"
+            exit 1
+          fi
         fi
 
         mkdir -p "$AK3_FOLDER"
         cp -f "$APK_PATH" "$AK3_FOLDER/SukiSU-Nova-Manager-latest.apk"
-        SELECTED_BADGING="$("$AAPT" dump badging "$APK_PATH")"
-        MANAGER_VERSION_CODE="$(sed -n "s/^package:.*versionCode='\\([^']*\\)'.*/\\1/p" <<< "$SELECTED_BADGING")"
-        MANAGER_VERSION_NAME="$(sed -n "s/^package:.*versionName='\\([^']*\\)'.*/\\1/p" <<< "$SELECTED_BADGING")"
-        echo "Included official SukiSU Nova Manager CI artifact: run ${RUN_ID}, commit ${RUN_SHA}"
-        echo "Manager APK: $(basename "$APK_PATH")"
-        echo "Manager package: com.sukisu.ultra"
-        echo "Manager version: ${MANAGER_VERSION_NAME:-unknown} (${MANAGER_VERSION_CODE:-unknown})"
-        echo "Artifact ID: ${ARTIFACT_ID}"
+        echo "Included latest experimental SukiSU Nova Manager from the official Telegram Test Builds link"
+        echo "Original attachment: ${APK_NAME}"
+        echo "Stable GitHub releases and GitHub Actions Manager artifacts were not used"
     - name: Create Kernel ZIP
       id: create_zip
       shell: bash
